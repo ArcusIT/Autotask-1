@@ -9,20 +9,38 @@
 Function Connect-WebAPI {
   <#
       .SYNOPSIS
-      This function re-loads the module with the correct parameters for full functionality
+      This function connects to the Autotask Web Services API, authenticates a user and creates a 
+      SOAP webservices proxy object. The connection object is cached on a per Prefix basis.
       .DESCRIPTION
-      This function is a wrapper that is included for backwards compatibility with previous module behavior.
-      These parameters should be passed to Import-Module -Variable directly, but previously the module 
-      consisted of two, nested modules. Now there is a single module with all functionality.
+      The function takes a credential object and uses it to authenticate and connect to the Autotask
+      Web Services API. This is done by creating a webservices proxy. The proxy object imports the SOAP 
+      WSDL definition file, creates all entity classes in PowerShell and exposes the basic methods
+      (query(), create(), update(), remove(), GetEntityInfo(), GetFieldInfo() and a few more). 
+
+      Using private functions this module continues to import information about entities and which fields
+      each entity has. It uses this information to create and import a dynamic module pr Prefix. 
+      Each module contains a complete set of PowerShell functions pr enntity. All entities gets a
+      Get-PrefixEntity function. Any updateable entities gets a Set-PrefixEntity function. All 
+      creatable entities gets a New-PrefixEntity function and all deletable objects gets a 
+      Remove-PrefixEntity function.
+
+      The per Prefix structure is important. It allows you to connect to Autotask with two or more 
+      different user accounts from two or more different Autotask tenants. This will allow you to 
+      automate between tenants. You can import and export data between tenants, transfer tickets, 
+      updates tickets in tenant2 from tickets in tenant1 and so on.
       .INPUTS
-      A PSCredential object. Required. 
-      A string used as ApiTrackingIdentifier. Required. 
+      A PSCredential object. Required. It will prompt for credentials if the object is not provided.
       .OUTPUTS
-      Nothing.
+      A webserviceproxy object is created.
       .EXAMPLE
-      Connect-AtwsWebAPI -Credential $Credential -ApiTrackingIdentifier $String
+      Connect-AtwsWebAPI
+      Prompts for a username and password and authenticates to Autotask
+      .EXAMPLE
+      Connect-AtwsWebAPI
       .NOTES
       NAME: Connect-AtwsWebAPI
+      .LINK
+      Get-AtwsData
   #>
 	
   [cmdletbinding()]
@@ -43,43 +61,155 @@ Function Connect-WebAPI {
     $Prefix = 'Atws',
 
     [Switch]
-    $RefreshCache
+    $RefreshCache,
+    
+    [String[]]
+    $RefreshEntity
   )
     
   Begin { 
     Write-Verbose ('{0}: Begin of function' -F $MyInvocation.MyCommand.Name)
     
-    # The module is already loaded. It has to be, or this function would not be in
-    # the users scope.
-    $ModuleName = $MyInvocation.MyCommand.Module.Name
+    $DefaultUri = 'https://webservices.Autotask.net/atservices/1.6/atws.wsdl'
     
-    # Store parameters to global variables. Force-reloading the module destroys this scope.
-    $Global:AtwsCredential = $Credential
-    $Global:AtwsApiTrackingIdentifier = $ApiTrackingIdentifier
+    # Unless warning level is specified explicitly - Show warnings!
+    If (-not ($WarningAction)) {
+      $Global:WarningPreference = 'Continue'
+    }
+
+    # Load support for TLS 1.2 if the Service Point Manager haven't loaded it yet
+    # This is now a REQUIREMENT to talk to the API endpoints
+    $Protocol = [System.Net.ServicePointManager]::SecurityProtocol
+    If ($Protocol.ToString() -notlike '*Tls12*') { 
+      [System.Net.ServicePointManager]::SecurityProtocol += 'tls12'
+    }
+    
     If ($RefreshCache.IsPresent) {
-      $Global:AtwsRefreshCachePattern = '*'
+      $RefreshEntity = '*'
     }
   }
   
   Process { 
-    Try 
-    { 
-      # First try to re-import the module by name
-      Import-Module -Name $ModuleName -Global -Prefix $Prefix -Force -Erroraction Stop
+    ## Preparing for a progressbar
+    # Prepare parameters for @splatting
+    $ProgressParameters = @{
+      Activity = 'Creating and importing functions for all Autotask entities.'
+      Id = 4
     }
-    Catch 
-    {
-      # If import by name fails the module has most likely been loaded directly from disk (path)
-      # Retry loading the module from its base directory
-      $ModulePath = $MyInvocation.MyCommand.Module.ModuleBase
+    
+    # Make sure Windows does not try to add a domain to username
+    # Prefix username with a backslash if nobody has added one yet
+    # And make sure we stick to the local scope - important when debugging...
+    If ($($local:Credential.UserName).Substring(0, 1) -ne '\') {
+      $local:Credential = New-Object System.Management.Automation.PSCredential("\$($local:Credential.UserName)", $($local:Credential.Password))
+    }
+    
+    # Post progress info to console
+    Write-Verbose ('{0}: Getting ZoneInfo for user {1} by calling default URI {2}' -F $MyInvocation.MyCommand.Name, $local:Credential.UserName, $DefaultUri)
+    Write-Progress -Status 'Creating connection' -PercentComplete 1 -CurrentOperation 'Locating correct datacenter' @ProgressParameters
+    
+    # First make an unauthenticated call to the DefaultURI to determine correct
+    # web services endpoint for the user we are going to authenticate as
+    $RootService = New-WebServiceProxy -URI $DefaultUri
+    
+    # Get ZoneInfo for username
+    $ZoneInfo = $RootService.getZoneInfo($local:Credential.UserName)
+    
+    # If we get an error the username is almost certainly misspelled or nonexistant
+    If ($ZoneInfo.ErrorCode -ne 0) {
+      Write-Progress -Status 'Creating connection' -PercentComplete 100 -CurrentOperation 'Operation failed' @ProgressParameters
+            
+      Throw [ApplicationException] ('Invalid username "{0}". Try again.' -f $local:Credential.UserName)
       
-      Import-Module -Name $ModulePath -Global -Prefix $Prefix -Force 
+    }
+    
+    # If we get to here the username exists and we have the information we need to try to authenticate
+    Write-Verbose ('{0}: Customer tenant ID: {1}, Web URL: {2}, SOAP endpoint: {3}' -F $MyInvocation.MyCommand.Name, $ZoneInfo.CI, $ZoneInfo.WebUrl, $ZoneInfo.Url)
+    
+    # Post progress to console
+    Write-Progress -Status 'Datacenter located' -PercentComplete 30 -CurrentOperation 'Authenticating to web service' @ProgressParameters
+          
+    # Pick the correct web services endpoint for the current username
+    # and change it to point at the WSDL definitoin
+    $Uri = $ZoneInfo.URL -replace 'atws.asmx', 'atws.wsdl'
+    
+    # Make sure a failure to create this object truly fails the script
+    Write-Verbose ('{0}: Creating New-WebServiceProxy against URI: {1}' -F $MyInvocation.MyCommand.Name, $Uri)
+    Try {
+      # Create a new webservice proxy or die trying...
+      $Script:Atws = New-WebServiceProxy -URI $Uri  -Credential $local:Credential -Namespace 'Autotask' -Class 'AutotaskAPI' -ErrorAction Stop
+      # Make sure the webserviceproxy authenticates every time (saves a webconnection and a few milliseconds)
+      $Script:Atws.PreAuthenticate = $True
+      
+      ## Add API Integrations Value 
+      # A dedicated object type has been created to store integration values
+      $AutotaskIntegrationsValue = New-Object Autotask.AutotaskIntegrations
 
+      # Set the integrationcode property to the API tracking identifier provided by the user
+      $AutotaskIntegrationsValue.IntegrationCode = $ApiTrackingIdentifier
+
+      # Add the integrations value to the Web Service Proxy
+      $Script:Atws.AutotaskIntegrationsValue = $AutotaskIntegrationsValue
+        
+      ## Add tenant identifier to connection
+      Add-Member -InputObject $Script:Atws -MemberType NoteProperty -Name CI -Value $ZoneInfo.CI -Force
+
+    }
+    Catch {
+      Throw [ApplicationException] 'Could not connect to Autotask WebAPI. Verify your credentials. If you are sure you have the rights - maybe you typed your password wrong?'    
+    }
+    
+   
+    Write-Verbose ('{0}: Running query Get-AtwsData -Entity Resource -Filter "username -eq $UserName"' -F $MyInvocation.MyCommand.Name)
+    
+    Write-Progress -Status 'Connected' -PercentComplete 60 -CurrentOperation 'Testing connection' @ProgressParameters
+       
+    # Get username part of credential
+    $UserName = $Credential.UserName.Split('@')[0].Trim('\')
+    $Result = Get-AtwsData -Entity Resource -Filter "username -eq $UserName"
+    
+    If ($Result) {
+    
+      # The connection has been verified. Use it to dynamically create functions for all entities
+      Write-Progress -Status 'Connection OK' -PercentComplete 90 -CurrentOperation 'Importing dynamic module' @ProgressParameters
+        
+      Write-Verbose ('{0}: Loading disk cache' -F $MyInvocation.MyCommand.Name)
+      
+      # Import the nested module and pass it a valid connection
+      Import-AtwsNestedModule -Connection $Script:Atws -Prefix $Prefix -RefreshEntity $RefreshEntity
+      
+      # Remove the connection from this scope
+      Remove-Variable -Name Atws -Scope Script -Force -ErrorAction SilentlyContinue
+      
+      # Check date and time formats and warn if the are different. This will affect how dates as text will be converted to datetime objects
+
+      $CultureInfo = ([CultureInfo]::CurrentCulture).DateTimeFormat
+
+      If ($Result.DateFormat -ne $CultureInfo.ShortDatePattern -and $Result.TimeFormat -ne $CultureInfo.ShortTimePattern) {
+        Write-host 'WARNING: DATE and TIME format of the current Autotask user should be updated to match local computer. Otherwise you risk that the API interprets your date and time entries wrong.' -ForegroundColor DarkYellow
+        Write-Host ('Log on to Autotask and edit resource {0}. Change Date format to "{1}" and Time format to "{2}"' -F $username, $CultureInfo.ShortDatePattern, $CultureInfo.ShortTimePattern) -ForegroundColor DarkYellow
+      }
+      ElseIf ($Result.DateFormat -ne $CultureInfo.ShortDatePattern) {
+        Write-host 'WARNING: DATE format of the current Autotask user should be updated to match local computer. Otherwise you risk that the API interprets your date entries wrong.' -ForegroundColor DarkYellow
+        Write-Host ('Log on to Autotask and edit resource {0}. Change Date format to "{1}"' -F $username, $CultureInfo.ShortDatePattern) -ForegroundColor DarkYellow
+      }
+
+      ElseIf ($Result.TimeFormat -ne $CultureInfo.ShortTimePattern) {
+        Write-host 'WARNING: TIME format of the current Autotask user should be updated to match local computer. Otherwise you risk that the API interprets your time entries wrong.' -ForegroundColor DarkYellow
+        Write-Host ('Log on to Autotask and edit resource {0}. Change Time format to "{1}"' -F $username, $CultureInfo.ShortTimePattern) -ForegroundColor DarkYellow
+      }
+    }
+    Else {
+      Remove-Variable -Name Atws -Scope Script
+      Throw [ApplicationException] 'Could not complete a query to Autotask WebAPI. Verify your credentials. You seem to have been logged in, but do you have the necessary rights?'    
     }
   }
   
   End {
     Write-Verbose ('{0}: End of function' -F $MyInvocation.MyCommand.Name)
+    Write-Progress -Status 'Completed' -PercentComplete 100 -CurrentOperation 'Done' @ProgressParameters
+       
   }
- 
+    
+    
 }

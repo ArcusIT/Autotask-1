@@ -63,13 +63,13 @@ Function Import-AtwsCmdLet
         Foreach ($Function in $FunctionDefinition.GetEnumerator()) {
           # Set path to powershell script file in user cache
           $FilePath = '{0}\Dynamic\{1}.ps1' -F $RootPath, $Function.Key
-          
+          <#
           # IMport the updated function
           . ([ScriptBlock]::Create($Function.Value))
           
           # Export the module member
           Export-ModuleMember -Function $Function.Key
-          
+          #>
           # Write the function to disk for faster load later
           Set-Content -Path $FilePath -Value $Function.Value -Force -Encoding UTF8           
         }
